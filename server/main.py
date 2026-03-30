@@ -1,11 +1,13 @@
-# main.py — CrowdSense AI API v4.1
+# main.py — CrowdSense AI API v4.2
 # Real-time crowd density engine:
-#   PRIMARY  → BestTime.app Live API  (if BESTTIME_API_KEY set)
+#   PRIMARY  → BestTime.app Live/Now API  (if BESTTIME_API_KEY set)
+#              - Improved venue matching (fuzzy + lat/lng filter)
+#              - Live endpoint → Now endpoint fallback chain
+#              - Weekly forecast for accurate hourly curves
 #   SECONDARY → Google Places popularity (if GOOGLE_MAPS_KEY set)
-#   TERTIARY → CrowdSense Physics Engine (re-calibrated — no flat or always-high values)
+#   TERTIARY → CrowdSense Physics Engine (re-calibrated)
 #              Inputs: venue type · time-of-day · day-of-week · weather proxy
 #              · IST public holiday calendar · venue capacity model
-#              · motion/IR sensor simulation from OSM foot-traffic data
 
 import os
 import time
@@ -31,7 +33,7 @@ import httpx
 app = FastAPI(
     title="CrowdSense AI API",
     description="Real-time crowd density — BestTime · Google Places · Physics Engine",
-    version="4.1.0",
+    version="4.2.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -203,14 +205,16 @@ MUMBAI_HOLIDAYS = {
 # live/forecast-now queries so we never re-register a venue unnecessarily.
 _venue_id_cache:       Dict[str, dict] = {}
 _live_cache:           Dict[str, dict] = {}
-_forecast_now_cache:   Dict[str, dict] = {}   # NEW: cache forecast-now per venue
+_forecast_now_cache:   Dict[str, dict] = {}   # cache forecast-now per venue
+_weekly_cache:         Dict[str, dict] = {}   # cache weekly raw curves
 _crowd_cache:          Dict[str, dict] = {}
 _weather_cache:        Dict[str, dict] = {}
 _google_places_cache:  Dict[str, dict] = {}
 
-LIVE_TTL          = 300    # 5 min
-FORECAST_NOW_TTL  = 600    # 10 min  (forecast-now changes hourly, cache longer)
-CROWD_TTL         = 240    # 4 min
+LIVE_TTL          = 180    # 3 min (more responsive to real-time changes)
+FORECAST_NOW_TTL  = 300    # 5 min  (reduced for better accuracy)
+WEEKLY_TTL        = 3600   # 1 hour (weekly forecasts are stable)
+CROWD_TTL         = 180    # 3 min (reduced for fresher data)
 WEATHER_TTL       = 1800   # 30 min
 PLACES_TTL        = 600    # 10 min
 VENUE_ID_TTL      = 86400  # 24 h
@@ -224,7 +228,7 @@ training_state = {
 realtime_cache: list = []
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ── CROWD PHYSICS ENGINE  (re-calibrated v4.1) ───────────────────────────────
+# ── CROWD PHYSICS ENGINE  (re-calibrated v4.2) ───────────────────────────────
 #
 # KEY FIXES vs v4.0:
 #  1. Curves scaled down — peak values now 0.65–0.75 (not 0.91–0.99) so that
@@ -465,31 +469,70 @@ async def _get_live_weather_mult(venue_type: str) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BestTime.app Integration  (v4.1 — properly wired as PRIMARY source)
+# BestTime.app Integration  (v4.2 — improved accuracy)
 #
-# KEY CHANGES from v4.0:
-#  • _besttime_get_venue_id now uses a SEARCH endpoint first (no credit cost)
-#    before falling back to forecast registration.  This prevents silent
-#    timeouts that caused the live branch to always fall through to physics.
-#  • _besttime_forecast_now results are cached per venue for 10 min so
-#    repeated calls within the same crowd-refresh cycle don't hit the API.
-#  • All BestTime density values are returned AS-IS (0–100 scale) — no
-#    extra multipliers that were inflating the result.
+# KEY CHANGES from v4.1:
+#  • Improved fuzzy venue matching (not just first-word match)
+#  • Added lat/lng filter endpoint for better venue resolution
+#  • _besttime_now() replaces _besttime_forecast_now() — more reliable
+#  • NO weather multiplier on BestTime data (BestTime already accounts for it)
+#  • Separate cache for weekly forecasts
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _besttime_get_venue_id(venue_name: str, venue_address: str) -> Optional[str]:
+def _fuzzy_venue_match(query: str, candidate: str) -> bool:
+    """
+    Improved fuzzy matching for venue names.
+    Returns True if query matches candidate reasonably well.
+    """
+    query_lower = query.lower().strip()
+    candidate_lower = candidate.lower().strip()
+    
+    # Exact match
+    if query_lower == candidate_lower:
+        return True
+    
+    # One contains the other
+    if query_lower in candidate_lower or candidate_lower in query_lower:
+        return True
+    
+    # Check if significant words match (at least 2 words or all words if fewer)
+    query_words = set(query_lower.replace(",", " ").split())
+    candidate_words = set(candidate_lower.replace(",", " ").split())
+    
+    # Remove common words
+    stop_words = {"the", "of", "at", "in", "on", "and", "a", "an", "station", "railway", "mumbai", "india"}
+    query_significant = query_words - stop_words
+    candidate_significant = candidate_words - stop_words
+    
+    if not query_significant:
+        query_significant = query_words
+    
+    # Check overlap
+    overlap = query_significant & candidate_significant
+    min_required = min(2, len(query_significant))
+    
+    return len(overlap) >= min_required
+
+
+async def _besttime_get_venue_id(venue_name: str, venue_address: str, lat: float = None, lng: float = None) -> Optional[str]:
     """
     Resolve BestTime venue_id for a known Mumbai location.
 
-    Strategy:
+    Strategy (v4.2 — improved accuracy):
       1. Check local cache (TTL 24 h) — avoids any API call on cache hit.
-      2. Try BestTime venue SEARCH endpoint (no credit cost, fast).
-      3. If not found, register via forecast endpoint (costs 1 forecast credit).
+      2. Try BestTime venue SEARCH endpoint with better fuzzy matching.
+      3. Try BestTime venues/filter endpoint with lat/lng if available.
+      4. If not found, register via forecast endpoint (costs 1 forecast credit).
     """
     if not BESTTIME_API_KEY:
         return None
 
-    cache_key = f"{venue_name}|{venue_address}".lower().strip()
+    # Use lat/lng in cache key for better hit rate
+    if lat and lng:
+        cache_key = f"{venue_name}|{lat:.4f},{lng:.4f}".lower().strip()
+    else:
+        cache_key = f"{venue_name}|{venue_address}".lower().strip()
+    
     cached = _venue_id_cache.get(cache_key)
     if cached and (time.time() - cached["ts"]) < VENUE_ID_TTL:
         return cached["venue_id"]
@@ -502,14 +545,15 @@ async def _besttime_get_venue_id(venue_name: str, venue_address: str) -> Optiona
                 params={
                     "api_key_private": BESTTIME_API_KEY,
                     "q":               venue_name,
-                    "num":             "3",
+                    "num":             "5",  # Increased for better matching
                 },
             )
             if resp.status_code == 200:
                 venues = resp.json().get("venues", [])
                 for v in venues:
-                    # Match by name similarity (case-insensitive partial match)
-                    if venue_name.lower().split()[0] in v.get("venue_name", "").lower():
+                    v_name = v.get("venue_name", "")
+                    # Use improved fuzzy matching
+                    if _fuzzy_venue_match(venue_name, v_name):
                         vid = v.get("venue_id")
                         if vid:
                             _venue_id_cache[cache_key] = {"venue_id": vid, "ts": time.time()}
@@ -517,19 +561,53 @@ async def _besttime_get_venue_id(venue_name: str, venue_address: str) -> Optiona
     except Exception as e:
         print(f"[BestTime] venue search error: {e}")
 
-    # ── Step 2: Register via forecast (costs 1 credit — only if not found) ───
+    # ── Step 2: Try filter by lat/lng if available (free) ────────────────────
+    if lat and lng:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://besttime.app/api/v1/venues/filter",
+                    params={
+                        "api_key_private": BESTTIME_API_KEY,
+                        "lat":             str(lat),
+                        "lng":             str(lng),
+                        "radius":          "200",  # 200m radius
+                        "num":             "5",
+                    },
+                )
+                if resp.status_code == 200:
+                    venues = resp.json().get("venues", [])
+                    for v in venues:
+                        v_name = v.get("venue_name", "")
+                        if _fuzzy_venue_match(venue_name, v_name):
+                            vid = v.get("venue_id")
+                            if vid:
+                                _venue_id_cache[cache_key] = {"venue_id": vid, "ts": time.time()}
+                                return vid
+                    # If no fuzzy match, take the closest one
+                    if venues:
+                        vid = venues[0].get("venue_id")
+                        if vid:
+                            _venue_id_cache[cache_key] = {"venue_id": vid, "ts": time.time()}
+                            return vid
+        except Exception as e:
+            print(f"[BestTime] venue filter error: {e}")
+
+    # ── Step 3: Register via forecast (costs 1 credit — only if not found) ───
     try:
         async with httpx.AsyncClient(timeout=15) as client:
+            params = {
+                "api_key_private": BESTTIME_API_KEY,
+                "venue_name":      venue_name,
+                "venue_address":   venue_address,
+            }
             resp = await client.post(
                 "https://besttime.app/api/v1/forecasts",
-                params={
-                    "api_key_private": BESTTIME_API_KEY,
-                    "venue_name":      venue_name,
-                    "venue_address":   venue_address,
-                },
+                params=params,
             )
             if resp.status_code == 200:
-                vid = resp.json().get("venue_info", {}).get("venue_id")
+                data = resp.json()
+                vid = data.get("venue_info", {}).get("venue_id")
                 if vid:
                     _venue_id_cache[cache_key] = {"venue_id": vid, "ts": time.time()}
                     return vid
@@ -540,12 +618,18 @@ async def _besttime_get_venue_id(venue_name: str, venue_address: str) -> Optiona
 
 
 async def _besttime_live(venue_id: str) -> Optional[dict]:
-    """Fetch real-time live busyness from BestTime. Cached 5 min."""
+    """
+    Fetch real-time live busyness from BestTime (v4.2 — improved).
+    Now also tries the 'now' endpoint if 'live' returns no data.
+    Cached 3 min.
+    """
     if not BESTTIME_API_KEY or not venue_id:
         return None
     cached = _live_cache.get(venue_id)
     if cached and (time.time() - cached["ts"]) < LIVE_TTL:
         return cached
+    
+    # Try the live endpoint first (real-time mobile signal data)
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -554,29 +638,44 @@ async def _besttime_live(venue_id: str) -> Optional[dict]:
             )
             if resp.status_code == 200:
                 data     = resp.json()
-                busyness = data.get("analysis", {}).get("venue_live_busyness")
-                if busyness is not None:
-                    result = {"busyness": float(busyness), "ts": time.time(), "raw": data}
+                analysis = data.get("analysis", {})
+                busyness = analysis.get("venue_live_busyness")
+                
+                # BestTime live may return -1 or null when no data
+                if busyness is not None and busyness >= 0:
+                    result = {
+                        "busyness": float(busyness), 
+                        "ts": time.time(), 
+                        "raw": data,
+                        "source": "besttime_live"
+                    }
                     _live_cache[venue_id] = result
                     return result
+                
+                # Check if there's a "venue_live_busyness_available" flag
+                if not analysis.get("venue_live_busyness_available", True):
+                    # Live data not available, will fall through to forecast
+                    pass
     except Exception as e:
         print(f"[BestTime] live error: {e}")
+    
     return None
 
 
-async def _besttime_forecast_now(venue_id: str) -> Optional[float]:
+async def _besttime_now(venue_id: str) -> Optional[dict]:
     """
-    Fetch BestTime's predicted busyness for the current hour.
-    Cached 10 min (forecast-now is hour-granular, no need to hit API every 4 min).
-    Returns value in 0–100 range (BestTime returns 0–100 already).
+    Fetch BestTime's 'now' endpoint — current hour's predicted + live blend.
+    This is more reliable than pure 'live' for many venues.
+    Cached 5 min.
     """
     if not BESTTIME_API_KEY or not venue_id:
         return None
-
-    cached = _forecast_now_cache.get(venue_id)
+    
+    cache_key = f"now_{venue_id}"
+    cached = _forecast_now_cache.get(cache_key)
     if cached and (time.time() - cached["ts"]) < FORECAST_NOW_TTL:
-        return cached["value"]
-
+        return cached
+    
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -584,21 +683,33 @@ async def _besttime_forecast_now(venue_id: str) -> Optional[float]:
                 params={"api_key_private": BESTTIME_API_KEY, "venue_id": venue_id},
             )
             if resp.status_code == 200:
-                data      = resp.json()
-                # BestTime returns 'now_raw' (0–100) or 'now' (label string)
-                intensity = data.get("analysis", {}).get("now_raw")
+                data = resp.json()
+                analysis = data.get("analysis", {})
+                
+                # Try to get raw intensity first (0-100)
+                intensity = analysis.get("now_raw")
+                
                 if intensity is None:
                     # Fallback: parse 'now' label → approximate numeric
-                    label_map = {"low": 20, "below_average": 35, "average": 50,
-                                 "above_average": 65, "high": 80, "very_high": 92}
-                    label     = data.get("analysis", {}).get("now", "")
+                    label_map = {
+                        "low": 20, "below_average": 35, "average": 50,
+                        "above_average": 65, "high": 80, "very_high": 92
+                    }
+                    label = analysis.get("now", "")
                     intensity = label_map.get(label.lower().replace(" ", "_"), None)
-                if intensity is not None:
-                    val = float(intensity)
-                    _forecast_now_cache[venue_id] = {"value": val, "ts": time.time()}
-                    return val
+                
+                if intensity is not None and intensity >= 0:
+                    result = {
+                        "busyness": float(intensity),
+                        "ts": time.time(),
+                        "raw": data,
+                        "source": "besttime_now"
+                    }
+                    _forecast_now_cache[cache_key] = result
+                    return result
     except Exception as e:
-        print(f"[BestTime] forecast-now error: {e}")
+        print(f"[BestTime] now error: {e}")
+    
     return None
 
 
@@ -639,49 +750,51 @@ async def _google_place_popularity(venue_name: str, lat: float, lng: float) -> O
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Master density resolver  (v4.1 — BestTime properly prioritised)
+# Master density resolver  (v4.2 — BestTime accuracy improved)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _resolve_density(loc: dict) -> Tuple[float, str]:
     """
-    Full fallback chain:
+    Full fallback chain (v4.2 — improved accuracy):
       1. BestTime Live  → raw busyness from real mobile-signal data (0–100)
-      2. BestTime Forecast-Now → predicted for current hour (0–100)
+      2. BestTime Now   → current hour blend of live + forecast (0–100)
       3. Google Places popularity blended with re-calibrated physics engine
       4. Physics engine alone
 
-    BestTime values are returned directly (no extra multipliers applied on top)
-    because BestTime already incorporates time-of-day and historical patterns.
-    OpenWeather live-weather multiplier is still applied to BestTime output
-    since BestTime doesn't account for today's actual weather.
+    BestTime values are returned AS-IS (no weather multiplier) because
+    BestTime already accounts for typical conditions. Weather multiplier
+    is ONLY applied to physics engine fallback.
     """
     venue_name    = loc["locationName"]
     venue_address = f"{venue_name}, {loc.get('area', 'Mumbai')}, Mumbai, India"
+    lat           = loc.get("latitude")
+    lng           = loc.get("longitude")
     ist           = _ist_now()
-    weather_mult  = await _get_live_weather_mult(loc.get("venue_type", "market"))
 
-    # ── 1. BestTime Live ──────────────────────────────────────────────────────
+    # ── 1 & 2. BestTime (Live then Now) ───────────────────────────────────────
     if BESTTIME_API_KEY:
-        venue_id = await _besttime_get_venue_id(venue_name, venue_address)
+        venue_id = await _besttime_get_venue_id(venue_name, venue_address, lat, lng)
         if venue_id:
+            # Try live endpoint first
             live = await _besttime_live(venue_id)
             if live and live.get("busyness") is not None:
-                # BestTime live busyness is already 0–100; apply weather only
-                density = min(max(live["busyness"] * weather_mult, 0), 100)
+                # BestTime live is already accurate — return as-is
+                density = min(max(live["busyness"], 0), 100)
                 return round(density, 1), "besttime_live"
 
-            # ── 2. BestTime Forecast-Now (hourly prediction) ─────────────────
-            forecast = await _besttime_forecast_now(venue_id)
-            if forecast is not None:
-                density = min(max(forecast * weather_mult, 0), 100)
-                return round(density, 1), "besttime_forecast"
+            # Try 'now' endpoint (blends live + forecast, more reliable)
+            now_data = await _besttime_now(venue_id)
+            if now_data and now_data.get("busyness") is not None:
+                density = min(max(now_data["busyness"], 0), 100)
+                return round(density, 1), "besttime_now"
 
-    # ── 3. Google Places + physics blend ─────────────────────────────────────
+    # ── 3. Google Places + physics blend (weather applied) ───────────────────
+    weather_mult = await _get_live_weather_mult(loc.get("venue_type", "market"))
     physics_density, _ = _compute_physics_density(loc, ist)
     physics_density    = min(max(physics_density * weather_mult, 0), 100)
 
     if GOOGLE_MAPS_KEY:
-        google_pop = await _google_place_popularity(venue_name, loc["latitude"], loc["longitude"])
+        google_pop = await _google_place_popularity(venue_name, lat, lng)
         if google_pop is not None:
             # 40% Google static + 60% physics (time-varying)
             blended = round(0.40 * google_pop + 0.60 * physics_density, 1)
@@ -693,6 +806,7 @@ async def _resolve_density(loc: dict) -> Tuple[float, str]:
 
 async def _resolve_density_custom(venue_name: str, lat: float, lng: float,
                                   venue_type: str = "market") -> Tuple[float, str]:
+    """Resolve density for custom/searched locations."""
     ist      = _ist_now()
     mock_loc = {
         "locationId": f"custom_{lat:.4f}_{lng:.4f}",
@@ -700,6 +814,23 @@ async def _resolve_density_custom(venue_name: str, lat: float, lng: float,
         "latitude": lat, "longitude": lng,
         "venue_type": venue_type,
     }
+    
+    # Try BestTime first for custom locations too
+    if BESTTIME_API_KEY:
+        venue_address = f"{venue_name}, Mumbai, India"
+        venue_id = await _besttime_get_venue_id(venue_name, venue_address, lat, lng)
+        if venue_id:
+            live = await _besttime_live(venue_id)
+            if live and live.get("busyness") is not None:
+                density = min(max(live["busyness"], 0), 100)
+                return round(density, 1), "besttime_live"
+            
+            now_data = await _besttime_now(venue_id)
+            if now_data and now_data.get("busyness") is not None:
+                density = min(max(now_data["busyness"], 0), 100)
+                return round(density, 1), "besttime_now"
+    
+    # Fallback to physics + weather
     weather_mult = await _get_live_weather_mult(venue_type)
     physics_d, _ = _compute_physics_density(mock_loc, ist)
     physics_d    = min(max(physics_d * weather_mult, 0), 100)
@@ -793,7 +924,7 @@ async def _nominatim_search(query: str, limit: int = 6,
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 "https://nominatim.openstreetmap.org/search", params=params,
-                headers={"User-Agent": "CrowdSenseAI/4.1 (contact@crowdsense.app)"},
+                headers={"User-Agent": "CrowdSenseAI/4.2 (contact@crowdsense.app)"},
             )
             _last_nominatim_call = time.time()
             if resp.status_code == 200:
@@ -882,8 +1013,8 @@ async def root():
     return {
         "message": "CrowdSense AI API — Real-Time Crowd Density Engine",
         "status":  "healthy",
-        "version": "4.1.0",
-        "engine":  "BestTime Live → BestTime Forecast → Google+Physics",
+        "version": "4.2.0",
+        "engine":  "BestTime Live → BestTime Now → Google+Physics",
         "docs":    "/docs",
     }
 
@@ -898,7 +1029,7 @@ async def health():
         "status":                  "ok",
         "model":                   "gemini-1.5-flash",
         "service":                 "CrowdSense AI",
-        "engine":                  "v4.1-besttime-primary",
+        "engine":                  "v4.2-besttime-accurate",
         "ist_time":                ist.strftime("%H:%M IST"),
         "ist_day":                 ist.strftime("%A"),
         "is_holiday":              _is_holiday(ist),
@@ -1294,10 +1425,43 @@ async def maps_place_details(place_id: str = Path(...)):
 # ─────────────────────────────────────────────────────────────────────────────
 # BEST TIME endpoint
 # ─────────────────────────────────────────────────────────────────────────────
-# v4.1: Now tries BestTime forecast data (weekly_raw) for the 24-hour curve
-# before falling back to the physics engine.  Also fetches the fastest
-# Google Maps Directions route so the response includes a real travel time.
+# v4.2: Enhanced accuracy:
+#  - BestTime weekly forecast for real historical hourly data
+#  - Live density blended into current hour for real-time accuracy
+#  - Travel time ALWAYS provided (Google Maps or Haversine fallback)
+#  - Added time_to_reach, current_density, worst_hour fields
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _estimate_travel_time(origin_lat: float, origin_lng: float,
+                          dest_lat: float, dest_lng: float,
+                          mode: str = "driving") -> dict:
+    """
+    Estimate travel time using Haversine distance when Google Maps unavailable.
+    Returns a route-like dict with estimated duration.
+    """
+    dist_km = _haversine(origin_lat, origin_lng, dest_lat, dest_lng)
+    ist = _ist_now()
+    hour = ist.hour
+    is_peak = (7 <= hour <= 10) or (17 <= hour <= 20)
+    
+    # Mumbai-realistic speeds (km/h)
+    speed_map = {
+        "driving": 15 if is_peak else 30,    # Mumbai traffic is notoriously slow
+        "bicycling": 12,
+        "walking": 5,
+        "transit": 20 if is_peak else 28,
+    }
+    speed = speed_map.get(mode, 20)
+    mins = max(int(dist_km / speed * 60), 2)
+    
+    return {
+        "duration": f"{mins} mins",
+        "duration_secs": mins * 60,
+        "distance": f"{round(dist_km, 1)} km",
+        "summary": f"Estimated via {mode}",
+        "source": "haversine_estimate",
+    }
+
 
 async def _besttime_weekly_raw(venue_id: str) -> Optional[Dict[int, float]]:
     """
@@ -1309,8 +1473,8 @@ async def _besttime_weekly_raw(venue_id: str) -> Optional[Dict[int, float]]:
         return None
 
     cache_key = f"weekly_{venue_id}"
-    cached    = _forecast_now_cache.get(cache_key)
-    if cached and (time.time() - cached["ts"]) < 3600:
+    cached    = _weekly_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < WEEKLY_TTL:
         return cached["value"]
 
     try:
@@ -1333,7 +1497,7 @@ async def _besttime_weekly_raw(venue_id: str) -> Optional[Dict[int, float]]:
                         raw = day_data.get("day_raw", [])
                         if len(raw) == 24:
                             curve = {h: float(raw[h]) for h in range(24)}
-                            _forecast_now_cache[cache_key] = {"value": curve, "ts": time.time()}
+                            _weekly_cache[cache_key] = {"value": curve, "ts": time.time()}
                             return curve
     except Exception as e:
         print(f"[BestTime] weekly raw error: {e}")
@@ -1347,38 +1511,40 @@ async def _google_maps_fastest_route(
 ) -> Optional[dict]:
     """
     Fetch fastest Google Maps route for the best-time page.
-    Returns a compact route dict or None.
+    Returns a compact route dict, or falls back to Haversine estimate.
     """
-    if not GOOGLE_MAPS_KEY:
-        return None
-    try:
-        params: dict = {
-            "origin":       f"{origin_lat},{origin_lng}",
-            "destination":  f"{dest_lat},{dest_lng}",
-            "mode":         mode,
-            "key":          GOOGLE_MAPS_KEY,
-            "alternatives": "false",
-        }
-        if mode == "driving":
-            params["departure_time"] = "now"
-            params["traffic_model"]  = "best_guess"
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://maps.googleapis.com/maps/api/directions/json", params=params)
-            if resp.status_code == 200 and resp.json().get("status") == "OK":
-                leg = resp.json()["routes"][0]["legs"][0]
-                dur = leg.get("duration_in_traffic") or leg.get("duration", {})
-                return {
-                    "duration":       dur.get("text", "N/A"),
-                    "duration_secs":  dur.get("value", 0),
-                    "distance":       leg.get("distance",{}).get("text","N/A"),
-                    "summary":        resp.json()["routes"][0].get("summary",""),
-                    "start_address":  leg.get("start_address",""),
-                    "end_address":    leg.get("end_address",""),
-                }
-    except Exception as e:
-        print(f"[BestTime Route] {e}")
-    return None
+    if GOOGLE_MAPS_KEY:
+        try:
+            params: dict = {
+                "origin":       f"{origin_lat},{origin_lng}",
+                "destination":  f"{dest_lat},{dest_lng}",
+                "mode":         mode,
+                "key":          GOOGLE_MAPS_KEY,
+                "alternatives": "false",
+            }
+            if mode == "driving":
+                params["departure_time"] = "now"
+                params["traffic_model"]  = "best_guess"
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://maps.googleapis.com/maps/api/directions/json", params=params)
+                if resp.status_code == 200 and resp.json().get("status") == "OK":
+                    leg = resp.json()["routes"][0]["legs"][0]
+                    dur = leg.get("duration_in_traffic") or leg.get("duration", {})
+                    return {
+                        "duration":       dur.get("text", "N/A"),
+                        "duration_secs":  dur.get("value", 0),
+                        "distance":       leg.get("distance",{}).get("text","N/A"),
+                        "summary":        resp.json()["routes"][0].get("summary",""),
+                        "start_address":  leg.get("start_address",""),
+                        "end_address":    leg.get("end_address",""),
+                        "source":         "google_maps_live",
+                    }
+        except Exception as e:
+            print(f"[BestTime Route] {e}")
+    
+    # Fallback to Haversine estimate
+    return _estimate_travel_time(origin_lat, origin_lng, dest_lat, dest_lng, mode)
 
 
 @app.get("/best-time")
@@ -1387,31 +1553,36 @@ async def best_time(
     to_location:   str = Query(..., alias="to"),
 ):
     """
-    Best-time-to-travel endpoint.
+    Best-time-to-travel endpoint (v4.2 — improved accuracy).
 
-    v4.1 changes:
-    - Hourly curve now sourced from BestTime weekly forecast (if key set)
-      so the curve reflects real historical patterns, not physics estimates.
-    - Current hour density comes from the live BestTime → forecast → physics chain.
-    - fastest_route field added: Google Maps real driving ETA for the journey.
+    Changes:
+    - Hourly curve sourced from BestTime weekly forecast (real historical data)
+    - Current hour blends live BestTime data for real-time accuracy
+    - Travel time always provided (Google Maps or Haversine estimate)
+    - Added time_to_reach field for clearer time-required info
     """
     loc = LOCATION_MAP.get(from_location)
+    dest_loc = LOCATION_MAP.get(to_location)
     ist = _ist_now()
 
     # ── Build 24-hour curve ───────────────────────────────────────────────────
     hourly: Dict[int, float] = {}
+    bt_curve: Optional[Dict[int, float]] = None
+    venue_id = None
 
     # Try BestTime weekly forecast first
-    bt_curve: Optional[Dict[int, float]] = None
     if BESTTIME_API_KEY and loc:
         venue_name    = loc["locationName"]
         venue_address = f"{venue_name}, {loc.get('area','Mumbai')}, Mumbai, India"
-        venue_id      = await _besttime_get_venue_id(venue_name, venue_address)
+        venue_id      = await _besttime_get_venue_id(
+            venue_name, venue_address, 
+            loc.get("latitude"), loc.get("longitude")
+        )
         if venue_id:
             bt_curve = await _besttime_weekly_raw(venue_id)
 
     if bt_curve:
-        # BestTime returns 0–100 directly
+        # BestTime returns 0–100 directly — this is real historical data
         hourly = {h: round(bt_curve[h], 1) for h in range(24)}
     else:
         # Physics fallback
@@ -1420,31 +1591,48 @@ async def best_time(
             d, _       = _compute_physics_density(loc or LOCATIONS[0], sim_dt)
             hourly[h]  = round(d, 1)
 
-    # Blend current live density into the current hour
+    # Blend current live density into the current hour for real-time accuracy
     if loc:
-        live_density, _ = await _resolve_density(loc)
+        live_density, live_source = await _resolve_density(loc)
         hourly[ist.hour] = live_density
 
+    # Find best hour (lowest crowd density)
     best_hour    = min(hourly, key=hourly.get)
     best_density = hourly[best_hour]
+    
+    # Also find the worst hour for comparison
+    worst_hour = max(hourly, key=hourly.get)
+    worst_density = hourly[worst_hour]
 
-    # ── Fastest route from Google Maps ────────────────────────────────────────
-    fastest_route = None
-    dest_loc = LOCATION_MAP.get(to_location)
+    # ── Travel time (always provided) ─────────────────────────────────────────
+    travel_info = None
     if loc and dest_loc:
-        fastest_route = await _google_maps_fastest_route(
+        travel_info = await _google_maps_fastest_route(
             loc["latitude"], loc["longitude"],
             dest_loc["latitude"], dest_loc["longitude"],
+            mode="driving",
+        )
+    elif loc and not dest_loc:
+        # If destination not in LOCATION_MAP, use center of Mumbai
+        travel_info = await _google_maps_fastest_route(
+            loc["latitude"], loc["longitude"],
+            MUMBAI_BOUNDS["center_lat"], MUMBAI_BOUNDS["center_lng"],
             mode="driving",
         )
 
     response = {
         "from":              from_location,
         "to":                to_location,
+        "current_hour":      ist.hour,
+        "current_density":   hourly[ist.hour],
+        "current_status":    _crowd_status(hourly[ist.hour]),
         "best_hour":         best_hour,
         "best_time":         f"{best_hour:02d}:00",
         "expected_density":  best_density,
         "status":            _crowd_status(best_density),
+        "worst_hour":        worst_hour,
+        "worst_time":        f"{worst_hour:02d}:00",
+        "worst_density":     worst_density,
         "city":              "Mumbai",
         "data_source":       "besttime_weekly" if bt_curve else "physics_engine",
         "hourly_predictions": [
@@ -1453,14 +1641,18 @@ async def best_time(
         ],
     }
 
-    if fastest_route:
+    # Always add travel time info
+    if travel_info:
         response["fastest_route"] = {
             "mode":          "driving",
-            "duration":      fastest_route["duration"],
-            "distance":      fastest_route["distance"],
-            "summary":       fastest_route["summary"],
-            "source":        "google_maps_live",
+            "duration":      travel_info["duration"],
+            "distance":      travel_info["distance"],
+            "summary":       travel_info.get("summary", "Direct route"),
+            "source":        travel_info.get("source", "unknown"),
         }
+        # Add time_to_reach as a clear field
+        response["time_to_reach"] = travel_info["duration"]
+        response["distance"] = travel_info["distance"]
 
     return response
 
@@ -1872,7 +2064,7 @@ async def realtime_training_data():
             "locations_covered": len(LOCATIONS),
             "city":              "Mumbai",
             "last_trained":      training_state.get("completed_at"),
-            "model_version":     "4.1-besttime-primary-physics-calibrated",
+            "model_version":     "4.2-besttime-accurate-physics-calibrated",
         }
     }
 
