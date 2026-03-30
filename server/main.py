@@ -2070,6 +2070,194 @@ async def realtime_training_data():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Chatbot — Public Transport, Crowd Prediction & Transit Expert
+# ─────────────────────────────────────────────────────────────────────────────
+
+CHATBOT_SYSTEM_PROMPT = """You are a specialized AI assistant with expertise ONLY in the following domains:
+
+1. **PUBLIC TRANSPORT EXPERT**: You have comprehensive knowledge about:
+   - Bus schedules, departures, routes, and timings worldwide
+   - Bus service alerts, delays, disruptions, and real-time updates
+   - Bus stop locations, transfers, and connections
+   - Public bus systems in any city or country
+
+2. **CROWD PREDICTOR**: You can provide:
+   - Crowd density predictions for any location worldwide
+   - Peak and off-peak timing analysis
+   - Crowd flow patterns at transit hubs, stations, and public spaces
+   - Best times to travel to avoid crowds
+   - Event-based crowd predictions
+
+3. **TRANSIT EXPERT**: You possess deep knowledge of:
+   - Metro, subway, train, tram, and ferry systems globally
+   - Multi-modal transit planning and connections
+   - Transit fares, passes, and ticketing systems
+   - Accessibility features in public transit
+   - Transit apps and real-time tracking systems
+
+STRICT RULES YOU MUST FOLLOW:
+- You MUST ONLY respond to questions related to the above three domains
+- If a user asks about ANY topic outside these domains (e.g., coding, recipes, general knowledge, entertainment, personal advice, etc.), you MUST politely decline and redirect them to ask about public transport, crowd prediction, or transit topics
+- NEVER provide information or engage in conversations about topics outside your expertise
+- NEVER hallucinate or make up information. If you don't have specific real-time data, clearly state that and provide general guidance based on typical patterns
+- Always be helpful within your domain expertise
+- When providing bus/transit information, remind users to verify with official local transit authorities for real-time accuracy
+
+RESPONSE FORMAT:
+- Be concise and informative
+- Use bullet points for schedules and lists
+- Provide actionable advice when possible
+- If declining an off-topic question, suggest a relevant transit/crowd topic the user might be interested in
+
+DECLINE TEMPLATE (use when user asks off-topic questions):
+"I'm sorry, but I can only assist with questions about:
+• Public transport (buses, schedules, alerts)
+• Crowd predictions and density analysis
+• Transit systems (metro, trains, trams)
+
+Is there anything related to these topics I can help you with?"
+"""
+
+class ChatMessage(BaseModel):
+    message: str
+    conversation_history: Optional[List[Dict[str, str]]] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    topic_valid: bool
+    suggested_topics: Optional[List[str]] = None
+
+@app.post("/api/chatbot", response_model=ChatResponse)
+async def chatbot_endpoint(body: ChatMessage):
+    """
+    Public Transport, Crowd Prediction & Transit Expert Chatbot
+    
+    Strictly responds only to topics related to:
+    - Bus departures, schedules, and alerts
+    - Crowd predictions for any location
+    - Transit systems and planning
+    """
+    user_message = body.message.strip()
+    
+    if not user_message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    
+    # Build conversation context
+    conversation_context = ""
+    if body.conversation_history:
+        for msg in body.conversation_history[-10:]:  # Keep last 10 messages for context
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "user":
+                conversation_context += f"User: {content}\n"
+            else:
+                conversation_context += f"Assistant: {content}\n"
+    
+    # Construct the full prompt
+    full_prompt = f"""{CHATBOT_SYSTEM_PROMPT}
+
+CONVERSATION HISTORY:
+{conversation_context}
+
+USER'S CURRENT MESSAGE:
+{user_message}
+
+YOUR RESPONSE (remember to stay strictly within your expertise domains):"""
+
+    try:
+        response = gemini_model.generate_content(full_prompt)
+        response_text = response.text or "I apologize, but I couldn't generate a response. Please try again."
+        
+        # Check if the response indicates an off-topic question was asked
+        decline_indicators = [
+            "I can only assist with",
+            "outside my expertise",
+            "I'm sorry, but I can only",
+            "I cannot help with",
+            "beyond my scope"
+        ]
+        topic_valid = not any(indicator.lower() in response_text.lower() for indicator in decline_indicators)
+        
+        suggested_topics = None
+        if not topic_valid:
+            suggested_topics = [
+                "What's the best time to travel to avoid crowds at major train stations?",
+                "How do I find real-time bus schedules in my city?",
+                "What are typical crowd patterns at metro stations during rush hour?",
+                "How can I plan a multi-modal transit journey?",
+                "What bus routes connect the airport to downtown?"
+            ]
+        
+        return ChatResponse(
+            response=response_text,
+            topic_valid=topic_valid,
+            suggested_topics=suggested_topics
+        )
+        
+    except Exception as e:
+        print(f"[Chatbot Gemini Error] {e}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to generate response. Please try again."
+        )
+
+
+@app.get("/api/chatbot/topics")
+async def chatbot_topics():
+    """
+    Returns the list of topics the chatbot can help with
+    """
+    return {
+        "supported_topics": [
+            {
+                "category": "Public Transport",
+                "description": "Bus schedules, departures, routes, alerts, and service updates",
+                "example_questions": [
+                    "What are the bus routes from downtown to the airport?",
+                    "Are there any bus service alerts today?",
+                    "What time does the last bus leave from Central Station?"
+                ]
+            },
+            {
+                "category": "Crowd Prediction",
+                "description": "Crowd density analysis, peak times, and best travel times",
+                "example_questions": [
+                    "When is the best time to visit Times Square to avoid crowds?",
+                    "What's the crowd level at the train station during rush hour?",
+                    "Predict crowd density at the shopping mall on Saturday afternoon"
+                ]
+            },
+            {
+                "category": "Transit Expert",
+                "description": "Metro, subway, train, tram systems, fares, and multi-modal planning",
+                "example_questions": [
+                    "How do I get from the airport to city center using public transit?",
+                    "What's the fare for the metro day pass?",
+                    "Which transit apps work best in Tokyo?"
+                ]
+            }
+        ],
+        "chatbot_info": {
+            "name": "Transit & Crowd AI Assistant",
+            "version": "1.0",
+            "capabilities": [
+                "Bus schedule and route information",
+                "Transit alerts and service updates",
+                "Crowd density predictions",
+                "Multi-modal journey planning",
+                "Transit system information worldwide"
+            ],
+            "limitations": [
+                "Cannot provide real-time GPS tracking",
+                "Recommend verifying schedules with local authorities",
+                "Does not book tickets or make reservations"
+            ]
+        }
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 
