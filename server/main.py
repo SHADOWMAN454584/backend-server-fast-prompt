@@ -47,7 +47,7 @@ app.add_middleware(
 # Environment
 # ─────────────────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY", "AIzaSyBOlWDOC2416twv5FuZsCu2ACX7BF3SjcM")
+GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY", "")
 OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_MAPS_KEY        = os.getenv("GOOGLE_MAPS_API_KEY", "")
 BESTTIME_API_KEY       = os.getenv("BESTTIME_API_KEY", "")
