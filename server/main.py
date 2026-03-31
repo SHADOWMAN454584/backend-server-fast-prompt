@@ -47,16 +47,23 @@ app.add_middleware(
 # Environment
 # ─────────────────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
-GOOGLE_MAPS_KEY  = os.getenv("GOOGLE_MAPS_API_KEY", "")
-BESTTIME_API_KEY = os.getenv("BESTTIME_API_KEY", "")
-OPENWEATHER_KEY  = os.getenv("OPENWEATHER_API_KEY", "")
+GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY", "")
+OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY", "")
+GOOGLE_MAPS_KEY        = os.getenv("GOOGLE_MAPS_API_KEY", "")
+BESTTIME_API_KEY       = os.getenv("BESTTIME_API_KEY", "")
+OPENWEATHER_KEY        = os.getenv("OPENWEATHER_API_KEY", "")
 
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY environment variable is required")
 
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+
+# OpenAI client for chatbot (uses separate API key)
+openai_client = None
+if OPENAI_API_KEY:
+    from openai import OpenAI
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mumbai Locations — verified coordinates + venue metadata
@@ -2142,31 +2149,32 @@ async def chatbot_endpoint(body: ChatMessage):
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     
-    # Build conversation context
-    conversation_context = ""
-    if body.conversation_history:
-        for msg in body.conversation_history[-10:]:  # Keep last 10 messages for context
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "user":
-                conversation_context += f"User: {content}\n"
-            else:
-                conversation_context += f"Assistant: {content}\n"
-    
-    # Construct the full prompt
-    full_prompt = f"""{CHATBOT_SYSTEM_PROMPT}
-
-CONVERSATION HISTORY:
-{conversation_context}
-
-USER'S CURRENT MESSAGE:
-{user_message}
-
-YOUR RESPONSE (remember to stay strictly within your expertise domains):"""
-
     try:
-        response = gemini_model.generate_content(full_prompt)
-        response_text = response.text or "I apologize, but I couldn't generate a response. Please try again."
+        if not openai_client:
+            raise HTTPException(status_code=503, detail="Chatbot service not configured. OPENAI_API_KEY is required.")
+        
+        # Build messages for OpenAI chat format
+        messages = [{"role": "system", "content": CHATBOT_SYSTEM_PROMPT}]
+        
+        # Add conversation history
+        if body.conversation_history:
+            for msg in body.conversation_history[-10:]:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role in ["user", "assistant"]:
+                    messages.append({"role": role, "content": content})
+        
+        # Add current user message
+        messages.append({"role": "user", "content": user_message})
+        
+        # Use OpenAI API for chatbot
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.7
+        )
+        response_text = response.choices[0].message.content or "I apologize, but I couldn't generate a response. Please try again."
         
         # Check if the response indicates an off-topic question was asked
         decline_indicators = [
@@ -2194,8 +2202,10 @@ YOUR RESPONSE (remember to stay strictly within your expertise domains):"""
             suggested_topics=suggested_topics
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[Chatbot Gemini Error] {e}")
+        print(f"[Chatbot OpenAI Error] {e}")
         traceback.print_exc()
         raise HTTPException(
             status_code=500,
