@@ -920,18 +920,21 @@ def _crowd_status(density: float) -> str:
 
 
 def _is_quota_error(e: Exception) -> bool:
-    """Detect quota / rate-limit errors from any provider (429, ResourceExhausted)."""
-    err_str = str(e).lower()
-    return any(kw in err_str for kw in (
-        "429", "quota", "resource_exhausted", "resourceexhausted",
-        "rate limit", "ratelimit", "too many requests", "insufficient_quota",
-    ))
+    """
+    Returns True for ANY Gemini error that should trigger Groq fallback:
+      - 429 quota / rate limit exceeded
+      - 400 API key expired or invalid
+      - 403 permission denied
+      - 500/503 upstream service errors
+    Always fall through to Groq on any Gemini failure.
+    """
+    return True  # Any Gemini exception should activate Groq emergency fallback
 
 
 def _gemini_ask(prompt: str) -> str:
     """
-    Ask Gemini (primary). On quota exhaustion, activates Groq emergency fallback.
-    Raises RuntimeError if both providers fail.
+    Ask Gemini (primary). On ANY Gemini error, activates Groq emergency fallback.
+    Raises RuntimeError only if both providers fail.
     """
     # ── Primary: Gemini ───────────────────────────────────────────────────────
     if gemini_model is not None:
@@ -941,11 +944,9 @@ def _gemini_ask(prompt: str) -> str:
             if text:
                 return text
         except Exception as e:
-            if _is_quota_error(e):
-                print(f"[Gemini] Quota exhausted — activating Groq emergency fallback. ({e})")
-            else:
-                print(f"[Gemini] Error: {e}")
-                traceback.print_exc()
+            # Always fall through to Groq regardless of error type
+            # (covers: 400 key expired, 429 quota, 403 permission, 500 upstream)
+            print(f"[Gemini] Failed ({type(e).__name__}: {e}) — activating Groq emergency fallback.")
     else:
         print("[Gemini] Not configured — activating Groq emergency fallback.")
 
@@ -2228,13 +2229,10 @@ async def chatbot_endpoint(body: ChatMessage):
             resp          = chat.send_message(full_prompt)
             response_text = (resp.text or "").strip() or None
         except Exception as e:
-            if _is_quota_error(e):
-                print(f"[Chatbot] Gemini quota exhausted — activating Groq emergency fallback.")
-                provider_error = "gemini_quota_exhausted"
-            else:
-                print(f"[Chatbot] Gemini error: {e}")
-                traceback.print_exc()
-                provider_error = "gemini_error"
+            # Always fall through to Groq on ANY Gemini error
+            # (400 key expired, 429 quota, 403 permission, 500 upstream, etc.)
+            print(f"[Chatbot] Gemini failed ({type(e).__name__}: {e}) — activating Groq emergency fallback.")
+            provider_error = "gemini_failed"
     else:
         print("[Chatbot] Gemini not configured — activating Groq emergency fallback.")
         provider_error = "gemini_not_configured"
