@@ -48,23 +48,30 @@ app.add_middleware(
 # ─────────────────────────────────────────────────────────────────────────────
 
 GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY", "")
-OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY", "")
+GROQ_API_KEY           = os.getenv("GROQ_API_KEY", "")
 GOOGLE_MAPS_KEY        = os.getenv("GOOGLE_MAPS_API_KEY", "")
 BESTTIME_API_KEY       = os.getenv("BESTTIME_API_KEY", "")
 OPENWEATHER_KEY        = os.getenv("OPENWEATHER_API_KEY", "")
 
+# ── Gemini (primary) ──────────────────────────────────────────────────────────
+# Using gemini-1.5-flash — higher free-tier quota than gemini-2.0-flash
 gemini_model = None
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    print("[AI] Gemini gemini-1.5-flash configured as primary provider.")
 else:
-    print("[WARNING] GEMINI_API_KEY not set — Gemini will be unavailable; falling back to OpenAI if configured.")
+    print("[WARNING] GEMINI_API_KEY not set — Gemini unavailable. Groq emergency fallback will be used if configured.")
 
-# OpenAI client for chatbot (uses separate API key)
-openai_client = None
-if OPENAI_API_KEY:
-    from openai import OpenAI
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# ── Groq (emergency fallback) ─────────────────────────────────────────────────
+# Free tier: 14,400 req/day, 30 req/min — activates only when Gemini is exhausted
+groq_client = None
+if GROQ_API_KEY:
+    from groq import Groq
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    print("[AI] Groq configured as emergency fallback provider.")
+else:
+    print("[WARNING] GROQ_API_KEY not set — no emergency fallback available.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mumbai Locations — verified coordinates + venue metadata
@@ -913,20 +920,20 @@ def _crowd_status(density: float) -> str:
 
 
 def _is_quota_error(e: Exception) -> bool:
-    """Detect Gemini quota / rate-limit errors (429, ResourceExhausted)."""
+    """Detect quota / rate-limit errors from any provider (429, ResourceExhausted)."""
     err_str = str(e).lower()
     return any(kw in err_str for kw in (
         "429", "quota", "resource_exhausted", "resourceexhausted",
-        "rate limit", "ratelimit", "too many requests",
+        "rate limit", "ratelimit", "too many requests", "insufficient_quota",
     ))
 
 
 def _gemini_ask(prompt: str) -> str:
     """
-    Ask Gemini. On quota/rate-limit errors (429) attempt OpenAI as fallback.
-    Raises RuntimeError with a clean message if both providers fail.
+    Ask Gemini (primary). On quota exhaustion, activates Groq emergency fallback.
+    Raises RuntimeError if both providers fail.
     """
-    # ── Try Gemini ────────────────────────────────────────────────────────────
+    # ── Primary: Gemini ───────────────────────────────────────────────────────
     if gemini_model is not None:
         try:
             response = gemini_model.generate_content(prompt)
@@ -935,29 +942,28 @@ def _gemini_ask(prompt: str) -> str:
                 return text
         except Exception as e:
             if _is_quota_error(e):
-                print(f"[Gemini] Quota exceeded — trying OpenAI fallback. ({e})")
+                print(f"[Gemini] Quota exhausted — activating Groq emergency fallback. ({e})")
             else:
                 print(f"[Gemini] Error: {e}")
                 traceback.print_exc()
-                # Non-quota Gemini error → still try OpenAI before giving up
     else:
-        print("[Gemini] Model not configured — trying OpenAI fallback.")
+        print("[Gemini] Not configured — activating Groq emergency fallback.")
 
-    # ── OpenAI fallback ───────────────────────────────────────────────────────
-    if openai_client is not None:
+    # ── Emergency fallback: Groq ──────────────────────────────────────────────
+    if groq_client is not None:
         try:
-            completion = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
+            completion = groq_client.chat.completions.create(
+                model="llama3-8b-8192",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=600,
                 timeout=20,
             )
             text = completion.choices[0].message.content or ""
             if text:
-                print("[OpenAI] Fallback succeeded.")
+                print("[Groq] Emergency fallback succeeded.")
                 return text
         except Exception as e:
-            print(f"[OpenAI Fallback] Error: {e}")
+            print(f"[Groq Emergency] Error: {e}")
             traceback.print_exc()
 
     raise RuntimeError("quota_exceeded")
@@ -1095,8 +1101,8 @@ async def health():
         "besttimeConfigured":      bool(BESTTIME_API_KEY),
         "weatherConfigured":       bool(OPENWEATHER_KEY),
         "geminiConfigured":        gemini_model is not None,
-        "openAiConfigured":        openai_client is not None,
-        "chatbotProvider":         "gemini" if gemini_model is not None else ("openai" if openai_client is not None else "none"),
+        "groqConfigured":          groq_client is not None,
+        "chatbotProvider":         "gemini" if gemini_model is not None else ("groq_emergency" if groq_client is not None else "none"),
         "total_heatmap_locations": len(LOCATIONS),
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
@@ -2188,9 +2194,9 @@ async def chatbot_endpoint(body: ChatMessage):
     Public Transport, Crowd Prediction & Transit Expert Chatbot.
 
     Provider chain:
-      1. Gemini chat session  (primary)
-      2. OpenAI gpt-3.5-turbo (fallback when Gemini quota exceeded or unavailable)
-      3. 503 with clear JSON detail if both fail
+      1. Gemini gemini-1.5-flash  (primary — highest free quota)
+      2. Groq  llama3-8b-8192     (emergency fallback — activates only on Gemini quota exhaustion)
+      3. 503 with clear JSON detail if both are exhausted
     """
     user_message = body.message.strip()
 
@@ -2200,7 +2206,7 @@ async def chatbot_endpoint(body: ChatMessage):
     response_text: Optional[str] = None
     provider_error: Optional[str] = None
 
-    # ── 1. Gemini chat session ────────────────────────────────────────────────
+    # ── 1. Primary: Gemini ────────────────────────────────────────────────────
     if gemini_model is not None:
         try:
             chat_history: List[dict] = []
@@ -2213,7 +2219,7 @@ async def chatbot_endpoint(body: ChatMessage):
                     elif role == "assistant":
                         chat_history.append({"role": "model", "parts": [content]})
 
-            chat       = gemini_model.start_chat(history=chat_history)
+            chat        = gemini_model.start_chat(history=chat_history)
             full_prompt = (
                 f"{CHATBOT_SYSTEM_PROMPT}\n\n"
                 f"User's question: {user_message}\n\n"
@@ -2223,18 +2229,18 @@ async def chatbot_endpoint(body: ChatMessage):
             response_text = (resp.text or "").strip() or None
         except Exception as e:
             if _is_quota_error(e):
-                print(f"[Chatbot] Gemini quota exceeded — trying OpenAI fallback. ({e})")
-                provider_error = "quota_exceeded"
+                print(f"[Chatbot] Gemini quota exhausted — activating Groq emergency fallback.")
+                provider_error = "gemini_quota_exhausted"
             else:
                 print(f"[Chatbot] Gemini error: {e}")
                 traceback.print_exc()
                 provider_error = "gemini_error"
     else:
-        print("[Chatbot] Gemini not configured — trying OpenAI fallback.")
+        print("[Chatbot] Gemini not configured — activating Groq emergency fallback.")
         provider_error = "gemini_not_configured"
 
-    # ── 2. OpenAI fallback ────────────────────────────────────────────────────
-    if response_text is None and openai_client is not None:
+    # ── 2. Emergency fallback: Groq ───────────────────────────────────────────
+    if response_text is None and groq_client is not None:
         try:
             messages: List[dict] = [{"role": "system", "content": CHATBOT_SYSTEM_PROMPT}]
             if body.conversation_history:
@@ -2245,21 +2251,21 @@ async def chatbot_endpoint(body: ChatMessage):
                         messages.append({"role": role, "content": content})
             messages.append({"role": "user", "content": user_message})
 
-            completion    = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
+            completion    = groq_client.chat.completions.create(
+                model="llama3-8b-8192",
                 messages=messages,
                 max_tokens=600,
                 timeout=20,
             )
             response_text = (completion.choices[0].message.content or "").strip() or None
             if response_text:
-                print("[Chatbot] OpenAI fallback succeeded.")
+                print("[Chatbot] Groq emergency fallback succeeded.")
         except Exception as e:
-            print(f"[Chatbot] OpenAI fallback error: {e}")
+            print(f"[Chatbot] Groq emergency fallback error: {e}")
             traceback.print_exc()
-            provider_error = "both_providers_failed"
+            provider_error = "all_providers_exhausted"
 
-    # ── 3. Both providers failed → 503 ───────────────────────────────────────
+    # ── 3. All providers exhausted → 503 ─────────────────────────────────────
     if not response_text:
         raise HTTPException(
             status_code=503,
