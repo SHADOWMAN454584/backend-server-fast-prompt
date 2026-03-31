@@ -47,17 +47,18 @@ app.add_middleware(
 # Environment
 # ─────────────────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY", "AIzaSyBOlWDOC2416twv5FuZsCu2ACX7BF3SjcM")
 OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_MAPS_KEY        = os.getenv("GOOGLE_MAPS_API_KEY", "")
 BESTTIME_API_KEY       = os.getenv("BESTTIME_API_KEY", "")
 OPENWEATHER_KEY        = os.getenv("OPENWEATHER_API_KEY", "")
 
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY environment variable is required")
-
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+gemini_model = None
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+else:
+    print("[WARNING] GEMINI_API_KEY not set — Gemini will be unavailable; falling back to OpenAI if configured.")
 
 # OpenAI client for chatbot (uses separate API key)
 openai_client = None
@@ -911,9 +912,55 @@ def _crowd_status(density: float) -> str:
     return "high"
 
 
+def _is_quota_error(e: Exception) -> bool:
+    """Detect Gemini quota / rate-limit errors (429, ResourceExhausted)."""
+    err_str = str(e).lower()
+    return any(kw in err_str for kw in (
+        "429", "quota", "resource_exhausted", "resourceexhausted",
+        "rate limit", "ratelimit", "too many requests",
+    ))
+
+
 def _gemini_ask(prompt: str) -> str:
-    response = gemini_model.generate_content(prompt)
-    return response.text or ""
+    """
+    Ask Gemini. On quota/rate-limit errors (429) attempt OpenAI as fallback.
+    Raises RuntimeError with a clean message if both providers fail.
+    """
+    # ── Try Gemini ────────────────────────────────────────────────────────────
+    if gemini_model is not None:
+        try:
+            response = gemini_model.generate_content(prompt)
+            text = response.text or ""
+            if text:
+                return text
+        except Exception as e:
+            if _is_quota_error(e):
+                print(f"[Gemini] Quota exceeded — trying OpenAI fallback. ({e})")
+            else:
+                print(f"[Gemini] Error: {e}")
+                traceback.print_exc()
+                # Non-quota Gemini error → still try OpenAI before giving up
+    else:
+        print("[Gemini] Model not configured — trying OpenAI fallback.")
+
+    # ── OpenAI fallback ───────────────────────────────────────────────────────
+    if openai_client is not None:
+        try:
+            completion = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=600,
+                timeout=20,
+            )
+            text = completion.choices[0].message.content or ""
+            if text:
+                print("[OpenAI] Fallback succeeded.")
+                return text
+        except Exception as e:
+            print(f"[OpenAI Fallback] Error: {e}")
+            traceback.print_exc()
+
+    raise RuntimeError("quota_exceeded")
 
 
 async def _nominatim_search(query: str, limit: int = 6,
@@ -1047,8 +1094,9 @@ async def health():
         "googleMapsConfigured":    bool(GOOGLE_MAPS_KEY),
         "besttimeConfigured":      bool(BESTTIME_API_KEY),
         "weatherConfigured":       bool(OPENWEATHER_KEY),
-        "geminiConfigured":        True,
-        "openAiConfigured":        True,
+        "geminiConfigured":        gemini_model is not None,
+        "openAiConfigured":        openai_client is not None,
+        "chatbotProvider":         "gemini" if gemini_model is not None else ("openai" if openai_client is not None else "none"),
         "total_heatmap_locations": len(LOCATIONS),
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
@@ -2137,80 +2185,116 @@ class ChatResponse(BaseModel):
 @app.post("/api/chatbot", response_model=ChatResponse)
 async def chatbot_endpoint(body: ChatMessage):
     """
-    Public Transport, Crowd Prediction & Transit Expert Chatbot
-    
-    Strictly responds only to topics related to:
-    - Bus departures, schedules, and alerts
-    - Crowd predictions for any location
-    - Transit systems and planning
+    Public Transport, Crowd Prediction & Transit Expert Chatbot.
+
+    Provider chain:
+      1. Gemini chat session  (primary)
+      2. OpenAI gpt-3.5-turbo (fallback when Gemini quota exceeded or unavailable)
+      3. 503 with clear JSON detail if both fail
     """
     user_message = body.message.strip()
-    
+
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
-    
-    try:
-        if not openai_client:
-            raise HTTPException(status_code=503, detail="Chatbot service not configured. OPENAI_API_KEY is required.")
-        
-        # Build messages for OpenAI chat format
-        messages = [{"role": "system", "content": CHATBOT_SYSTEM_PROMPT}]
-        
-        # Add conversation history
-        if body.conversation_history:
-            for msg in body.conversation_history[-10:]:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                if role in ["user", "assistant"]:
-                    messages.append({"role": role, "content": content})
-        
-        # Add current user message
-        messages.append({"role": "user", "content": user_message})
-        
-        # Use OpenAI API for chatbot
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.7
-        )
-        response_text = response.choices[0].message.content or "I apologize, but I couldn't generate a response. Please try again."
-        
-        # Check if the response indicates an off-topic question was asked
-        decline_indicators = [
-            "I can only assist with",
-            "outside my expertise",
-            "I'm sorry, but I can only",
-            "I cannot help with",
-            "beyond my scope"
-        ]
-        topic_valid = not any(indicator.lower() in response_text.lower() for indicator in decline_indicators)
-        
-        suggested_topics = None
-        if not topic_valid:
-            suggested_topics = [
-                "What's the best time to travel to avoid crowds at major train stations?",
-                "How do I find real-time bus schedules in my city?",
-                "What are typical crowd patterns at metro stations during rush hour?",
-                "How can I plan a multi-modal transit journey?",
-                "What bus routes connect the airport to downtown?"
-            ]
-        
-        return ChatResponse(
-            response=response_text,
-            topic_valid=topic_valid,
-            suggested_topics=suggested_topics
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[Chatbot OpenAI Error] {e}")
-        traceback.print_exc()
+
+    response_text: Optional[str] = None
+    provider_error: Optional[str] = None
+
+    # ── 1. Gemini chat session ────────────────────────────────────────────────
+    if gemini_model is not None:
+        try:
+            chat_history: List[dict] = []
+            if body.conversation_history:
+                for msg in body.conversation_history[-10:]:
+                    role    = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    if role == "user":
+                        chat_history.append({"role": "user",  "parts": [content]})
+                    elif role == "assistant":
+                        chat_history.append({"role": "model", "parts": [content]})
+
+            chat       = gemini_model.start_chat(history=chat_history)
+            full_prompt = (
+                f"{CHATBOT_SYSTEM_PROMPT}\n\n"
+                f"User's question: {user_message}\n\n"
+                "Please provide a helpful response following the guidelines above."
+            )
+            resp          = chat.send_message(full_prompt)
+            response_text = (resp.text or "").strip() or None
+        except Exception as e:
+            if _is_quota_error(e):
+                print(f"[Chatbot] Gemini quota exceeded — trying OpenAI fallback. ({e})")
+                provider_error = "quota_exceeded"
+            else:
+                print(f"[Chatbot] Gemini error: {e}")
+                traceback.print_exc()
+                provider_error = "gemini_error"
+    else:
+        print("[Chatbot] Gemini not configured — trying OpenAI fallback.")
+        provider_error = "gemini_not_configured"
+
+    # ── 2. OpenAI fallback ────────────────────────────────────────────────────
+    if response_text is None and openai_client is not None:
+        try:
+            messages: List[dict] = [{"role": "system", "content": CHATBOT_SYSTEM_PROMPT}]
+            if body.conversation_history:
+                for msg in body.conversation_history[-10:]:
+                    role    = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    if role in ("user", "assistant"):
+                        messages.append({"role": role, "content": content})
+            messages.append({"role": "user", "content": user_message})
+
+            completion    = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                max_tokens=600,
+                timeout=20,
+            )
+            response_text = (completion.choices[0].message.content or "").strip() or None
+            if response_text:
+                print("[Chatbot] OpenAI fallback succeeded.")
+        except Exception as e:
+            print(f"[Chatbot] OpenAI fallback error: {e}")
+            traceback.print_exc()
+            provider_error = "both_providers_failed"
+
+    # ── 3. Both providers failed → 503 ───────────────────────────────────────
+    if not response_text:
         raise HTTPException(
-            status_code=500,
-            detail="Failed to generate response. Please try again."
+            status_code=503,
+            detail={
+                "response":       "AI service is temporarily unavailable. Please try again shortly.",
+                "success":        False,
+                "provider_error": provider_error or "unknown",
+            },
         )
+
+    # ── Determine topic validity ──────────────────────────────────────────────
+    decline_indicators = [
+        "I can only assist with",
+        "outside my expertise",
+        "I'm sorry, but I can only",
+        "I cannot help with",
+        "beyond my scope",
+    ]
+    topic_valid = not any(ind.lower() in response_text.lower() for ind in decline_indicators)
+
+    suggested_topics = None
+    if not topic_valid:
+        suggested_topics = [
+            "What's the best time to travel to avoid crowds at major train stations?",
+            "How do I find real-time bus schedules in my city?",
+            "What are typical crowd patterns at metro stations during rush hour?",
+            "How can I plan a multi-modal transit journey?",
+            "What bus routes connect the airport to downtown?",
+        ]
+
+    return ChatResponse(
+        response=response_text,
+        topic_valid=topic_valid,
+        suggested_topics=suggested_topics,
+    )
 
 
 @app.get("/api/chatbot/topics")
