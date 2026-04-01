@@ -1,0 +1,233 @@
+# Public Transport Enquiry API Endpoints Documentation
+
+**Base URL:** `https://your-server-url` (or `http://localhost:8000` for local development)
+
+**API Version:** 1.0.0
+
+---
+
+## GET Endpoints
+
+### 1. Root Endpoint - `/`
+**Method:** `GET`
+
+**Description:** Get API information and available endpoints
+
+**Response:**
+```json
+{
+  "message": "Public Transport Enquiry API is running successfully!",
+  "status": "healthy",
+  "version": "1.0.0",
+  "endpoints": {
+    "health": "/health",
+    "text_chat": "/generate (POST)",
+    "image_analysis": "/analyze-image (POST)",
+    "documentation": "/docs"
+  }
+}
+```
+
+---
+
+### 2. Health Check - `/health`
+**Method:** `GET`
+
+**Description:** Check if the API service is running and healthy
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "model": "gemini-1.5-flash",
+  "service": "Public Transport Enquiry API"
+}
+```
+
+---
+
+### 3. Ping - `/ping`
+**Method:** `GET`
+
+**Description:** Simple ping endpoint for monitoring service availability
+
+**Response:**
+```json
+{
+  "ping": "pong",
+  "timestamp": "ok"
+}
+```
+
+---
+
+## POST Endpoints
+
+### 1. Generate Transport Information - `/generate`
+**Method:** `POST`
+
+**Description:** Get public transport information based on text query
+
+**Request Body:**
+```json
+{
+  "prompt": "What are the nearest bus stops from XYZ location to ABC area?"
+}
+```
+
+**Request Headers:**
+```
+Content-Type: application/json
+```
+
+**Response (Success):**
+```json
+{
+  "success": true,
+  "response": "Based on your location, the nearest transport options are... [transport information]",
+  "error": null
+}
+```
+
+**Response (Error):**
+```json
+{
+  "success": false,
+  "response": "",
+  "error": "Please provide a transport-related question"
+}
+```
+
+**Status Codes:**
+- `200`: Success
+- `400`: Bad request
+- `500`: Server error
+
+---
+
+### 2. Analyze Transport Image - `/analyze-image`
+**Method:** `POST`
+
+**Description:** Upload an image (transport scene, route sign, stop, vehicle, etc.) for AI analysis
+
+**Request Format:** `multipart/form-data`
+
+**Form Fields:**
+- `file` (required): Image file (PNG, JPG, JPEG, WEBP, etc.)
+- `prompt` (optional): Custom analysis question. Default: "Analyze this transport-related image and provide transport information"
+
+**Example cURL:**
+```bash
+curl -X POST "http://localhost:8000/analyze-image" \
+  -F "file=@bus_stop_image.jpg" \
+  -F "prompt=What route information can you see in this image?"
+```
+
+**Response (Success):**
+```json
+{
+  "success": true,
+  "response": "Based on the image analysis, I can see... [detailed transport information]",
+  "error": null
+}
+```
+
+**Response (Error):**
+```json
+{
+  "success": false,
+  "response": "",
+  "error": "Please upload a valid image file"
+}
+```
+
+**Supported Image Types:** PNG, JPG, JPEG, WEBP
+
+**Max File Size:** As per FastAPI default (typically 25MB)
+
+---
+
+## Frontend Integration Examples
+
+### JavaScript/React - Text Query
+```javascript
+const askFarmingQuestion = async (question) => {
+  const response = await fetch('https://your-server-url/generate', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ prompt: question })
+  });
+
+  const data = await response.json();
+  return data;
+};
+```
+
+### JavaScript/React - Image Analysis
+```javascript
+const analyzeImage = async (imageFile, customPrompt = '') => {
+  const formData = new FormData();
+  formData.append('file', imageFile);
+  if (customPrompt) {
+    formData.append('prompt', customPrompt);
+  }
+
+  const response = await fetch('https://your-server-url/analyze-image', {
+    method: 'POST',
+    body: formData
+  });
+
+  const data = await response.json();
+  return data;
+};
+```
+
+### JavaScript - Health Check
+```javascript
+const checkHealth = async () => {
+  const response = await fetch('https://your-server-url/health');
+  const data = await response.json();
+  return data;
+};
+```
+
+---
+
+## Error Handling
+
+All endpoints follow a consistent error response format:
+
+```json
+{
+  "success": false,
+  "response": "",
+  "error": "Descriptive error message"
+}
+```
+
+**Common Errors:**
+- Empty or invalid prompt → `"Please provide a farming-related question"`
+- Invalid image format → `"Please upload a valid image file"`
+- Server issues → `"Sorry, I'm having trouble processing your request. Please try again later."`
+
+---
+
+## API Features
+
+✅ CORS enabled for all origins
+✅ Text-based farming queries
+✅ Image analysis (crops, diseases, pests, soil conditions)
+✅ Google Gemini 1.5 Flash model integration
+✅ Designed for farmers - uses simple, clear language
+✅ Supports Indian farming conditions and practices
+
+---
+
+## Notes
+
+- The API filters questions to agriculture/farming topics only
+- For non-farming questions, it will politely redirect to farming-related queries
+- Image analysis focuses on: crops, diseases, pests, soil conditions, and farming equipment
+- All responses are generated by Google Gemini AI with farming-specific system prompts

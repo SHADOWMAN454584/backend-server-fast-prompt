@@ -11,8 +11,8 @@ from typing import Optional
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="KrishiMithra API",
-    description="AI-powered farming assistant using Google Gemini",
+    title="Public Transport Enquiry API",
+    description="AI-powered public transport expert providing information about routes, crowd, and nearest transport options",
     version="1.0.0"
 )
 
@@ -35,20 +35,21 @@ genai.configure(api_key=GEMINI_API_KEY)
 # Use the vision-capable model
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Farming advisor system prompt
-FARMING_SYSTEM_PROMPT = """You are KrishiMithra, a Digital Krishi Advisor specifically designed to help farmers in India and around the world.
+# Public Transport Enquiry system prompt
+PUBLIC_TRANSPORT_SYSTEM_PROMPT = """You are a Public Transport Expert Chatbot designed to assist users with comprehensive public transportation information.
 
 IMPORTANT GUIDELINES:
-- You ONLY answer questions related to farming, agriculture, crops, irrigation, soil management, fertilizers, pesticides, plant diseases, weather impacts, livestock, and agricultural practices.
-- If asked about anything outside agriculture/farming, politely redirect: "I'm KrishiMithra, your farming advisor. Please ask me about crops, agriculture, or farming-related topics."
-- Always provide practical, actionable advice that farmers can implement.
-- Consider Indian farming conditions, climate, and traditional practices when relevant.
-- Be helpful, encouraging, and supportive to farmers.
-- Use simple, clear language that farmers can easily understand.
-- For image analysis, focus on identifying crops, diseases, pests, soil conditions, or farming equipment.
-- Provide solutions that are cost-effective and accessible to small-scale farmers.
+- You ONLY answer questions related to public transport, including buses, trains, metros, cabs, rickshaws, and auto-rickshaws.
+- Provide information about: routes and schedules, crowd or congestion levels, ticket prices, nearest transport stops, travel time estimates, and available transportation options.
+- If asked about anything outside public transportation, politely redirect: "I'm a public transport expert. Please ask me about bus routes, trains, nearest transport stops, crowds, or any transportation-related queries."
+- Always provide practical, accurate information that helps users plan their journeys.
+- Consider local transport systems and real-time conditions when relevant.
+- Be helpful, courteous, and supportive to travelers.
+- Use simple, clear language that all users can easily understand.
+- For image analysis, focus on identifying transport-related scenes, vehicles, stops, or route indicators.
+- Provide information that helps users find the quickest, most convenient, and cost-effective transport options.
 
-Remember: You are here to help farmers grow better crops and improve their agricultural practices."""
+Remember: You are here to help users navigate public transportation efficiently and reach their destinations seamlessly."""
 
 # Pydantic models
 class TextPrompt(BaseModel):
@@ -63,7 +64,7 @@ class APIResponse(BaseModel):
 @app.get("/")
 async def root():
     return {
-        "message": "KrishiMithra API is running successfully!",
+        "message": "Public Transport Enquiry API is running successfully!",
         "status": "healthy",
         "version": "1.0.0",
         "endpoints": {
@@ -80,25 +81,25 @@ async def health_check():
     return {
         "status": "ok",
         "model": "gemini-1.5-flash",
-        "service": "KrishiMithra API"
+        "service": "Public Transport Enquiry API"
     }
 
-# Text-based farming advice endpoint
+# Text-based transport enquiry endpoint
 @app.post("/generate", response_model=APIResponse)
-async def generate_farming_advice(body: TextPrompt):
+async def generate_transport_info(body: TextPrompt):
     """
-    Generate farming advice from text prompt
+    Generate public transport information from text prompt
     """
     try:
         if not body.prompt.strip():
             return APIResponse(
                 success=False,
                 response="",
-                error="Please provide a farming-related question"
+                error="Please provide a transport-related question"
             )
         
         # Combine system prompt with user question
-        full_prompt = f"{FARMING_SYSTEM_PROMPT}\n\nFarmer's Question: {body.prompt.strip()}"
+        full_prompt = f"{PUBLIC_TRANSPORT_SYSTEM_PROMPT}\n\nUser Query: {body.prompt.strip()}"
         
         # Generate response using Gemini
         response = model.generate_content(full_prompt)
@@ -117,7 +118,7 @@ async def generate_farming_advice(body: TextPrompt):
         )
         
     except Exception as e:
-        print(f"Error in generate_farming_advice: {str(e)}")
+        print(f"Error in generate_transport_info: {str(e)}")
         return APIResponse(
             success=False,
             response="",
@@ -126,12 +127,12 @@ async def generate_farming_advice(body: TextPrompt):
 
 # Image analysis endpoint
 @app.post("/analyze-image", response_model=APIResponse)
-async def analyze_farming_image(
+async def analyze_transport_image(
     file: UploadFile = File(...),
-    prompt: str = Form("Analyze this farming-related image and provide agricultural advice")
+    prompt: str = Form("Analyze this transport-related image and provide transport information")
 ):
     """
-    Analyze farming/crop images and provide advice
+    Analyze transport-related images and provide information
     """
     try:
         print(f"=== IMAGE ANALYSIS REQUEST ===")
@@ -156,7 +157,7 @@ async def analyze_farming_image(
         print(f"Image processed: {image.size}, mode: {image.mode}")
         
         # Combine system prompt with user prompt for image analysis
-        full_prompt = f"{FARMING_SYSTEM_PROMPT}\n\nFarmer's Question: {prompt}\n\nPlease analyze the attached image and provide specific farming advice based on what you observe."
+        full_prompt = f"{PUBLIC_TRANSPORT_SYSTEM_PROMPT}\n\nUser Query: {prompt}\n\nPlease analyze the attached image and provide specific transport information based on what you observe."
         
         print("Sending to Gemini with image...")
         # Generate response with image analysis
@@ -180,7 +181,7 @@ async def analyze_farming_image(
         )
         
     except Exception as e:
-        print(f"Error in analyze_farming_image: {str(e)}")
+        print(f"Error in analyze_transport_image: {str(e)}")
         print(f"Error type: {type(e)}")
         import traceback
         print(f"Traceback: {traceback.format_exc()}")
