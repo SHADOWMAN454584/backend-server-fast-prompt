@@ -33,7 +33,7 @@ if not GEMINI_API_KEY:
 # Configure Google Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 # Use the vision-capable model
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 # Public Transport Enquiry system prompt
 PUBLIC_TRANSPORT_SYSTEM_PROMPT = """You are a Public Transport Expert Chatbot designed to assist users with comprehensive public transportation information.
@@ -80,7 +80,7 @@ async def root():
 async def health_check():
     return {
         "status": "ok",
-        "model": "gemini-1.5-flash",
+        "model": "gemini-2.0-flash",
         "service": "Public Transport Enquiry API"
     }
 
