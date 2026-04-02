@@ -58,8 +58,8 @@ OPENWEATHER_KEY        = os.getenv("OPENWEATHER_API_KEY", "")
 gemini_model = None
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-    print("[AI] Gemini gemini-1.5-flash configured as primary provider.")
+    gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+    print("[AI] Gemini gemini-2.0-flash configured as primary provider.")
 else:
     print("[WARNING] GEMINI_API_KEY not set — Gemini unavailable. Groq emergency fallback will be used if configured.")
 
@@ -2196,7 +2196,7 @@ async def chatbot_endpoint(body: ChatMessage):
 
     Provider chain:
       1. Gemini gemini-1.5-flash  (primary — highest free quota)
-      2. Groq  llama3-8b-8192     (emergency fallback — activates only on Gemini quota exhaustion)
+      2. Groq  llama-3.1-8b-instant (emergency fallback — activates only on Gemini quota exhaustion)
       3. 503 with clear JSON detail if both are exhausted
     """
     user_message = body.message.strip()
@@ -2250,7 +2250,7 @@ async def chatbot_endpoint(body: ChatMessage):
             messages.append({"role": "user", "content": user_message})
 
             completion    = groq_client.chat.completions.create(
-                model="llama3-8b-8192",
+                model="llama-3.1-8b-instant",
                 messages=messages,
                 max_tokens=600,
                 timeout=20,
